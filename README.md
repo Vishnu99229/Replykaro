@@ -56,6 +56,18 @@ AI-powered WhatsApp receptionist for dental and aesthetic clinics in India. Hand
 | POST | `/webhook/whatsapp` | Twilio WhatsApp incoming messages |
 | POST | `/webhook/status` | Twilio message status callbacks |
 
+## Demo Data
+
+To populate the dashboard and analytics pages with realistic demo data (patients, conversations, and appointments), run the included seed script:
+
+```bash
+npm run seed:demo
+```
+
+**Note**: This script connects to the Supabase instance defined by `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` in your root `.env` file. It inserts data for a single "Demo Clinic". 
+
+To wipe the demo data, simply run the seed script again (it's idempotent and clears old demo rows before re-inserting) or manually delete the clinic with ID `demo-clinic-123` from your database (which will cascade to delete demo appointments and related data).
+
 ## License
 
 Private — All rights reserved.
