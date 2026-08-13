@@ -1,8 +1,30 @@
 const Anthropic = require("@anthropic-ai/sdk");
-const { getOrCreatePatient, getConversationHistory, saveMessage, getClinicContext } = require("./db");
+const {
+  getOrCreatePatient,
+  getConversationHistory,
+  saveMessage,
+  getClinicContext,
+  logAppointment,
+} = require("./db");
 const { checkAvailability, bookAppointment } = require("./calendar");
+const { notifyOwner } = require("./notifications");
 
 const anthropic = new Anthropic();
+
+const MAX_TOOL_ITERATIONS = 6;
+const RATE_LIMIT_MAX = 15;
+const RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000;
+const rateLimitMap = new Map(); // phone → timestamps[]
+
+function isRateLimited(phone) {
+  const now = Date.now();
+  const timestamps = (rateLimitMap.get(phone) || []).filter(
+    (t) => now - t < RATE_LIMIT_WINDOW_MS
+  );
+  timestamps.push(now);
+  rateLimitMap.set(phone, timestamps);
+  return timestamps.length > RATE_LIMIT_MAX;
+}
 
 function buildSystemPrompt(clinic) {
   return `You are Priya, the AI receptionist for ${clinic.name}. You respond to patients on WhatsApp.
@@ -114,22 +136,43 @@ const tools = [
   },
 ];
 
-async function handleToolCall(toolName, toolInput, clinicId) {
+async function handleToolCall(toolName, toolInput, { clinic, patient, recentMessages }) {
   switch (toolName) {
     case "check_available_slots": {
       const slots = await checkAvailability(toolInput.date, toolInput.preferred_time);
       return JSON.stringify(slots);
     }
     case "book_appointment": {
+      const duration = toolInput.duration_minutes || 30;
       const result = await bookAppointment({
-        clinicId,
+        clinicId: clinic.id,
         ...toolInput,
-        duration_minutes: toolInput.duration_minutes || 30,
+        duration_minutes: duration,
       });
+
+      if (result.success) {
+        try {
+          await logAppointment({
+            clinicId: clinic.id,
+            patientId: patient.id,
+            date: toolInput.date,
+            time: toolInput.time,
+            treatment: toolInput.treatment,
+            duration,
+          });
+        } catch (err) {
+          console.error(
+            `[DB][CRITICAL] Failed to persist appointment after calendar booking:`,
+            err.message || err
+          );
+        }
+      }
+
       return JSON.stringify(result);
     }
     case "flag_for_human": {
       console.log(`[FLAG] Human needed: ${toolInput.reason}`);
+      await notifyOwner(clinic, toolInput.reason, patient, recentMessages);
       return JSON.stringify({ status: "flagged", message: "Team has been notified" });
     }
     default:
@@ -138,19 +181,22 @@ async function handleToolCall(toolName, toolInput, clinicId) {
 }
 
 async function handleWhatsAppMessage({ phone, name, message }) {
+  if (isRateLimited(phone)) {
+    return "You've sent a lot of messages quickly. Please wait a couple of minutes and I'll be right with you.";
+  }
+
   const patient = await getOrCreatePatient(phone, name);
   const clinic = await getClinicContext("demo-clinic");
   const history = await getConversationHistory(patient.id, 20);
 
   await saveMessage(patient.id, "user", message);
 
-  const messages = [
-    ...history.map((msg) => ({
-      role: msg.role,
-      content: msg.content,
-    })),
+  const recentMessages = [
+    ...history.map((msg) => ({ role: msg.role, content: msg.content })),
     { role: "user", content: message },
   ];
+
+  const messages = [...recentMessages];
 
   let response = await anthropic.messages.create({
     model: "claude-sonnet-4-20250514",
@@ -160,10 +206,24 @@ async function handleWhatsAppMessage({ phone, name, message }) {
     messages,
   });
 
-  // Handle tool use loop
+  // Handle tool use loop (capped to prevent infinite spins)
+  let toolIterations = 0;
   while (response.stop_reason === "tool_use") {
+    toolIterations += 1;
+    if (toolIterations > MAX_TOOL_ITERATIONS) {
+      console.log(`[Claude] Tool loop cap hit for patient ${patient.id}`);
+      const fallback =
+        "Let me get someone from the team to help you with this. One moment please.";
+      await saveMessage(patient.id, "assistant", fallback);
+      return fallback;
+    }
+
     const toolUseBlock = response.content.find((block) => block.type === "tool_use");
-    const toolResult = await handleToolCall(toolUseBlock.name, toolUseBlock.input, clinic.id);
+    const toolResult = await handleToolCall(toolUseBlock.name, toolUseBlock.input, {
+      clinic,
+      patient,
+      recentMessages,
+    });
 
     messages.push({ role: "assistant", content: response.content });
     messages.push({

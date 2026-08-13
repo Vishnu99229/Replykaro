@@ -56,6 +56,34 @@ AI-powered WhatsApp receptionist for dental and aesthetic clinics in India. Hand
 | POST | `/webhook/whatsapp` | Twilio WhatsApp incoming messages |
 | POST | `/webhook/status` | Twilio message status callbacks |
 
+## Demo Data
+
+To populate the dashboard and analytics pages with realistic demo data (patients, conversations, and appointments), run the included seed script:
+
+```bash
+npm run seed:demo
+```
+
+**Note**: This script connects to the Supabase instance defined by `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` in your root `.env` file. It inserts data for a single "Demo Clinic". 
+
+To wipe the demo data, simply run the seed script again (it's idempotent and clears old demo rows before re-inserting) or manually delete the clinic with ID `demo-clinic-123` from your database (which will cascade to delete demo appointments and related data).
+
+## BSP (WhatsApp Provider) Configuration
+
+ReplyKaro uses a swappable adapter pattern for WhatsApp providers. Change providers by setting `BSP_PROVIDER` in your env.
+
+### Supported providers
+- `twilio` (default, production-ready)
+- `gupshup` (stub — implementation pending)
+
+### Adding a new BSP
+1. Create `src/bsp/<name>.js` implementing the interface in `src/bsp/interface.js`.
+2. Register it in `src/bsp/index.js`.
+3. Add env vars for it in `.env.example`.
+4. Set `BSP_PROVIDER=<name>` in Railway.
+
+The rest of the app (webhooks, reminders, notifications) requires no changes.
+
 ## License
 
 Private — All rights reserved.

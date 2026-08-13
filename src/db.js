@@ -40,7 +40,7 @@ async function getConversationHistory(patientId, limit = 20) {
     .from("messages")
     .select("role, content, created_at")
     .eq("patient_id", patientId)
-    .order("created_at", { ascending: true })
+    .order("created_at", { ascending: false })
     .limit(limit);
 
   if (error) {
@@ -48,7 +48,8 @@ async function getConversationHistory(patientId, limit = 20) {
     return [];
   }
 
-  return data || [];
+  // Reverse so Claude gets chronological order (oldest → newest)
+  return (data || []).reverse();
 }
 
 async function saveMessage(patientId, role, content) {
@@ -92,6 +93,7 @@ function getDemoClinic() {
     address: "4th Block, Koramangala, Bangalore — near Sony World Signal",
     hours: "Mon-Sat 9 AM to 8 PM, Sunday 10 AM to 2 PM",
     phone: "+919901763361",
+    owner_phone: process.env.CLINIC_OWNER_PHONE || "+919901763361",
     payment_methods: "Cash, UPI, all debit/credit cards. 0% EMI available on treatments above ₹10,000",
     parking: "Free parking in the building basement",
     additional_info: "First X-ray is complimentary. Children age 3+. Wheelchair accessible. Same-day emergency dental.",
@@ -135,6 +137,22 @@ async function logAppointment({ clinicId, patientId, date, time, treatment, dura
   return data;
 }
 
+async function updateAppointmentReminderFlag(appointmentId, flag) {
+  if (flag !== "reminder_24h_sent" && flag !== "reminder_2h_sent") {
+    throw new Error(`Invalid reminder flag: ${flag}`);
+  }
+
+  const { error } = await supabase
+    .from("appointments")
+    .update({ [flag]: true })
+    .eq("id", appointmentId);
+
+  if (error) {
+    console.error(`[DB] Error updating ${flag} for ${appointmentId}:`, error);
+    throw error;
+  }
+}
+
 async function getUpcomingAppointments(hoursAhead) {
   const now = new Date();
   const target = new Date(now.getTime() + hoursAhead * 60 * 60 * 1000);
@@ -163,5 +181,6 @@ module.exports = {
   saveMessage,
   getClinicContext,
   logAppointment,
+  updateAppointmentReminderFlag,
   getUpcomingAppointments,
 };
