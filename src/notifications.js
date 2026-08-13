@@ -1,4 +1,4 @@
-const { sendWhatsApp } = require("./reminders");
+const bsp = require("./bsp");
 
 /**
  * Notify the clinic owner that Priya escalated a conversation.
@@ -10,27 +10,27 @@ async function notifyOwner(clinic, reason, patient, recentMessages) {
     return;
   }
 
-  const templateSid = process.env.TWILIO_TEMPLATE_SID_OWNER_FLAG;
-  if (!templateSid) {
-    console.error("[Notify] TWILIO_TEMPLATE_SID_OWNER_FLAG not set — cannot send flag notification");
-    return;
-  }
-
   const lastPatientMessage =
     [...(recentMessages || [])]
       .reverse()
       .find((m) => m.role === "user")?.content || "—";
 
   try {
-    await sendWhatsApp(clinic.owner_phone, null, {
-      contentSid: templateSid,
-      contentVariables: {
+    const result = await bsp.sendTemplate({
+      to: clinic.owner_phone,
+      templateRef: "owner_flag",
+      variables: {
         "1": patient.name || "Patient",
         "2": patient.phone || "—",
         "3": reason || "Needs attention",
         "4": lastPatientMessage.slice(0, 200),
       },
     });
+
+    if (!result.success) {
+      throw new Error(result.error || "sendTemplate failed");
+    }
+
     console.log(`[Notify] Owner flagged for patient ${patient.id}: ${reason}`);
   } catch (error) {
     console.error(`[Notify] Failed to notify owner:`, error.message);

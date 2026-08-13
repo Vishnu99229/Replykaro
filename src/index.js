@@ -1,7 +1,6 @@
 require("dotenv").config();
 const express = require("express");
-const twilio = require("twilio");
-const { MessagingResponse } = require("twilio").twiml;
+const bsp = require("./bsp");
 const { handleWhatsAppMessage } = require("./whatsapp");
 const { runReminders } = require("./reminders");
 const cron = require("node-cron");
@@ -11,105 +10,89 @@ app.set("trust proxy", true);
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
-// Per-instance MessageSid dedup. Won't survive restart or multi-instance scale-out —
-// acceptable because Twilio's retry window is short.
-const processedMessageSids = new Map();
-const MAX_PROCESSED_SIDS = 1000;
+// Per-instance messageId dedup. Won't survive restart or multi-instance scale-out —
+// acceptable because BSP retry windows are short.
+const processedMessageIds = new Map();
+const MAX_PROCESSED_IDS = 1000;
 
-function rememberMessageSid(sid) {
-  if (!sid) return false;
-  if (processedMessageSids.has(sid)) return true;
-  processedMessageSids.set(sid, Date.now());
-  if (processedMessageSids.size > MAX_PROCESSED_SIDS) {
-    const oldestKey = processedMessageSids.keys().next().value;
-    processedMessageSids.delete(oldestKey);
+function rememberMessageId(id) {
+  if (!id) return false;
+  if (processedMessageIds.has(id)) return true;
+  processedMessageIds.set(id, Date.now());
+  if (processedMessageIds.size > MAX_PROCESSED_IDS) {
+    const oldestKey = processedMessageIds.keys().next().value;
+    processedMessageIds.delete(oldestKey);
   }
   return false;
 }
 
-function validateTwilioRequest(req, res, next) {
-  if (process.env.SKIP_TWILIO_VALIDATION === "true") {
-    return next();
-  }
-
-  const signature = req.get("X-Twilio-Signature") || "";
-  const url = `${req.protocol}://${req.get("host")}${req.originalUrl}`;
-  const valid = twilio.validateRequest(
-    process.env.TWILIO_AUTH_TOKEN,
-    signature,
-    url,
-    req.body
-  );
-
-  if (!valid) {
-    console.log(`[Security] Invalid Twilio signature from ${req.ip}`);
+function validateBspWebhook(req, res, next) {
+  if (!bsp.validateWebhook(req)) {
+    console.log(`[Security] Invalid ${bsp.name} signature from ${req.ip}`);
     return res.status(403).send("Forbidden");
   }
-
   return next();
-}
-
-function emptyTwiml() {
-  return new MessagingResponse().toString();
 }
 
 // Health check
 app.get("/", (req, res) => {
-  res.json({ status: "ReplyKaro is running", timestamp: new Date().toISOString() });
+  res.json({
+    status: "ReplyKaro is running",
+    bsp: bsp.name,
+    timestamp: new Date().toISOString(),
+  });
 });
 
-// Twilio WhatsApp webhook — incoming messages land here
-app.post("/webhook/whatsapp", validateTwilioRequest, async (req, res) => {
+// WhatsApp inbound webhook — BSP-agnostic
+app.post("/webhook/whatsapp", validateBspWebhook, async (req, res) => {
   try {
-    const { From, Body, ProfileName, MessageSid, NumMedia } = req.body;
+    const msg = bsp.parseIncomingMessage(req);
 
-    if (rememberMessageSid(MessageSid)) {
-      return res.type("text/xml").send(emptyTwiml());
+    if (rememberMessageId(msg.messageId)) {
+      const { contentType, body } = bsp.buildWebhookResponse({ replyText: "" });
+      return res.type(contentType).send(body);
     }
 
-    const numMedia = parseInt(NumMedia || "0", 10);
-    const bodyText = (Body || "").trim();
-
     // Empty body + no media → ignore (status/system noise)
-    if (!bodyText && numMedia === 0) {
-      return res.type("text/xml").send(emptyTwiml());
+    if (!msg.body && !msg.hasMedia) {
+      const { contentType, body } = bsp.buildWebhookResponse({ replyText: "" });
+      return res.type(contentType).send(body);
     }
 
     // Media-only (voice notes, images, stickers) — don't call Claude
-    if (!bodyText && numMedia > 0) {
-      const twiml = new MessagingResponse();
-      twiml.message(
-        "Hi! I can only read text messages right now. Could you please type your question or request? For voice calls, please ring the clinic directly."
-      );
-      return res.type("text/xml").send(twiml.toString());
+    if (!msg.body && msg.hasMedia) {
+      const { contentType, body } = bsp.buildWebhookResponse({
+        replyText:
+          "Hi! I can only read text messages right now. Could you please type your question or request? For voice calls, please ring the clinic directly.",
+      });
+      return res.type(contentType).send(body);
     }
 
-    const patientPhone = From.replace("whatsapp:", "");
-    const patientName = ProfileName || "there";
-
-    console.log(`[WhatsApp] ${patientName} (${patientPhone}): ${bodyText}`);
+    const patientName = msg.profileName || "there";
+    console.log(`[WhatsApp] ${patientName} (${msg.from}): ${msg.body}`);
 
     const reply = await handleWhatsAppMessage({
-      phone: patientPhone,
+      phone: msg.from,
       name: patientName,
-      message: bodyText,
+      message: msg.body,
     });
 
-    const twiml = new MessagingResponse();
-    twiml.message(reply);
-    res.type("text/xml").send(twiml.toString());
+    const { contentType, body } = bsp.buildWebhookResponse({ replyText: reply });
+    res.type(contentType).send(body);
   } catch (error) {
     console.error("[WhatsApp] Error:", error);
-    const twiml = new MessagingResponse();
-    twiml.message("Sorry, I'm having a moment. Please try again or call us directly.");
-    res.type("text/xml").send(twiml.toString());
+    const { contentType, body } = bsp.buildWebhookResponse({
+      replyText: "Sorry, I'm having a moment. Please try again or call us directly.",
+    });
+    res.type(contentType).send(body);
   }
 });
 
-// Twilio status callbacks
-app.post("/webhook/status", validateTwilioRequest, (req, res) => {
-  const { MessageSid, MessageStatus } = req.body;
-  console.log(`[Status] ${MessageSid}: ${MessageStatus}`);
+// Delivery status callbacks.
+// Note: not all BSPs send status callbacks the same way (or at all).
+// For now we just log whatever arrives after signature validation.
+app.post("/webhook/status", validateBspWebhook, (req, res) => {
+  console.log(`[Status][${bsp.name}]`, req.body);
   res.sendStatus(200);
 });
 
@@ -132,5 +115,5 @@ cron.schedule("30 2 * * *", async () => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`[ReplyKaro] Server running on port ${PORT}`);
+  console.log(`[ReplyKaro] Server running on port ${PORT} (BSP=${bsp.name})`);
 });
