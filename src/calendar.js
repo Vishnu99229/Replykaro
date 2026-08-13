@@ -35,20 +35,37 @@ async function checkAvailability(date, preferredTime = "any") {
       orderBy: "startTime",
     });
 
-    const busySlots = (response.data.items || []).map((event) => ({
-      start: new Date(event.start.dateTime).toLocaleTimeString("en-IN", {
-        hour: "2-digit",
-        minute: "2-digit",
-        hour12: false,
-        timeZone: "Asia/Kolkata",
-      }),
-      end: new Date(event.end.dateTime).toLocaleTimeString("en-IN", {
-        hour: "2-digit",
-        minute: "2-digit",
-        hour12: false,
-        timeZone: "Asia/Kolkata",
-      }),
-    }));
+    const events = response.data.items || [];
+
+    // All-day block (start.date without start.dateTime) → treat whole day as busy
+    const hasAllDayBlock = events.some(
+      (event) => event.start && event.start.date && !event.start.dateTime
+    );
+    if (hasAllDayBlock) {
+      return {
+        date,
+        available: false,
+        message: "That day is fully blocked. Try a different day.",
+        slots: [],
+      };
+    }
+
+    const busySlots = events
+      .filter((event) => event.start && event.start.dateTime)
+      .map((event) => ({
+        start: new Date(event.start.dateTime).toLocaleTimeString("en-IN", {
+          hour: "2-digit",
+          minute: "2-digit",
+          hour12: false,
+          timeZone: "Asia/Kolkata",
+        }),
+        end: new Date(event.end.dateTime).toLocaleTimeString("en-IN", {
+          hour: "2-digit",
+          minute: "2-digit",
+          hour12: false,
+          timeZone: "Asia/Kolkata",
+        }),
+      }));
 
     const allSlots = generateSlots(range.start, range.end, 30);
     const availableSlots = allSlots.filter((slot) => {

@@ -1,19 +1,29 @@
 const twilio = require("twilio");
-const { getUpcomingAppointments } = require("./db");
+const { getUpcomingAppointments, updateAppointmentReminderFlag } = require("./db");
 
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
 async function runReminders() {
-  // 24-hour reminders
+  // 24-hour reminders (WhatsApp template — outside 24h customer service window)
   const in24h = await getUpcomingAppointments(24);
   for (const apt of in24h) {
     if (apt.reminder_24h_sent) continue;
 
     const patient = apt.patients;
-    const message = `Hi ${patient.name}! This is a reminder that you have an appointment tomorrow at ${formatTime12h(apt.time)} for ${apt.treatment}. See you then! Reply CANCEL if you need to reschedule.`;
-
-    await sendWhatsApp(patient.phone, message);
-    console.log(`[Reminder] 24h reminder sent to ${patient.name}`);
+    try {
+      await sendWhatsApp(patient.phone, null, {
+        contentSid: process.env.TWILIO_TEMPLATE_SID_24H,
+        contentVariables: {
+          "1": patient.name,
+          "2": formatTime12h(apt.time),
+          "3": apt.treatment,
+        },
+      });
+      await updateAppointmentReminderFlag(apt.id, "reminder_24h_sent");
+      console.log(`[Reminder] 24h reminder sent to ${patient.name}`);
+    } catch (error) {
+      console.error(`[Reminder] 24h failed for ${patient.name}:`, error.message);
+    }
   }
 
   // 2-hour reminders
@@ -22,22 +32,48 @@ async function runReminders() {
     if (apt.reminder_2h_sent) continue;
 
     const patient = apt.patients;
-    const message = `Hi ${patient.name}! Just a quick reminder — your appointment is in about 2 hours at ${formatTime12h(apt.time)}. See you soon!`;
-
-    await sendWhatsApp(patient.phone, message);
-    console.log(`[Reminder] 2h reminder sent to ${patient.name}`);
+    try {
+      await sendWhatsApp(patient.phone, null, {
+        contentSid: process.env.TWILIO_TEMPLATE_SID_2H,
+        contentVariables: {
+          "1": patient.name,
+          "2": formatTime12h(apt.time),
+        },
+      });
+      await updateAppointmentReminderFlag(apt.id, "reminder_2h_sent");
+      console.log(`[Reminder] 2h reminder sent to ${patient.name}`);
+    } catch (error) {
+      console.error(`[Reminder] 2h failed for ${patient.name}:`, error.message);
+    }
   }
 }
 
-async function sendWhatsApp(to, body) {
+/**
+ * Send a WhatsApp message.
+ * @param {string} to - Phone number (without whatsapp: prefix)
+ * @param {string|null} body - Free-form text (within 24h session window)
+ * @param {{ contentSid?: string, contentVariables?: object }} [options]
+ *   If contentSid is set, sends via Twilio Content API (approved template).
+ */
+async function sendWhatsApp(to, body, options = {}) {
+  const { contentSid, contentVariables } = options;
+  const payload = {
+    from: process.env.TWILIO_WHATSAPP_NUMBER,
+    to: `whatsapp:${to}`,
+  };
+
+  if (contentSid) {
+    payload.contentSid = contentSid;
+    payload.contentVariables = JSON.stringify(contentVariables || {});
+  } else {
+    payload.body = body;
+  }
+
   try {
-    await twilioClient.messages.create({
-      from: process.env.TWILIO_WHATSAPP_NUMBER,
-      to: `whatsapp:${to}`,
-      body,
-    });
+    await twilioClient.messages.create(payload);
   } catch (error) {
     console.error(`[Twilio] Error sending to ${to}:`, error.message);
+    throw error;
   }
 }
 
